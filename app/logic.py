@@ -26,10 +26,10 @@ def evaluate_permit_request(
     health_unknown = [n for n in batch if n not in latest]
     unhealthy = [n for n in batch if n in latest and not latest[n].healthy]
 
-    # 条件 2：未结束许可占用
+    # 条件 2：未结束许可占用（已通过单节点完工释放的节点不再占用）
     node_owner: dict[str, str] = {}
     for p in open_permits:
-        for n in p.nodes:
+        for n in p.occupied_nodes:
             node_owner[n] = p.request_id
     occupied = {n: node_owner[n] for n in batch if n in node_owner}
 
@@ -88,18 +88,34 @@ def evaluate_finish(
 ) -> dict[str, str]:
     """结束许可的校验。返回 {节点: 不满足原因}，空 dict 表示可以结束。
 
-    本批每个节点都须满足：最新探活在获批后采集、显示健康、
-    启动标识与获批时不同。
+    只检查仍被本许可占用（尚未单节点完工释放）的节点：每个节点都须满足
+    最新探活在获批后采集、显示健康、启动标识与获批时不同。
+    已释放节点不重复检查；若全部节点均已释放，这里自然返回空 dict，
+    由结单接口完成最后的收尾。
     """
     problems: dict[str, str] = {}
-    for n in permit.nodes:
-        rep = latest.get(n)
-        if rep is None:
-            problems[n] = "no_liveness_report"
-        elif rep.sampled_at <= permit.approved_at:
-            problems[n] = "not_sampled_after_approval"
-        elif not rep.healthy:
-            problems[n] = "unhealthy"
-        elif rep.boot_id == permit.boot_ids_at_approval[n]:
-            problems[n] = "boot_id_unchanged"
+    for n in permit.occupied_nodes:
+        reason = evaluate_node_completion(permit, n, latest)
+        if reason is not None:
+            problems[n] = reason
     return problems
+
+
+def evaluate_node_completion(
+    permit: PermitRecord, node_id: str, latest: dict[str, LatestReport]
+) -> str | None:
+    """单节点完工校验。返回不满足原因；满足条件返回 None。
+
+    结单条件与整单结束一致：最新探活在获批后采集、显示健康、
+    启动标识与获批时不同。
+    """
+    rep = latest.get(node_id)
+    if rep is None:
+        return "no_liveness_report"
+    if rep.sampled_at <= permit.approved_at:
+        return "not_sampled_after_approval"
+    if not rep.healthy:
+        return "unhealthy"
+    if rep.boot_id == permit.boot_ids_at_approval[node_id]:
+        return "boot_id_unchanged"
+    return None

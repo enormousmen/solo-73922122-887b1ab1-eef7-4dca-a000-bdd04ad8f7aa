@@ -13,7 +13,8 @@
 - **并发申请**在写事务（`BEGIN IMMEDIATE`）中串行判定，守住多数票。
 - **同号同批重发**返回原许可（HTTP 200）；同号不同批返回 409。
 - 许可与探活记录落盘 SQLite，**服务重启后保留**。
-- **结束许可**要求本批每个节点的最新探活：在获批后采集、健康、启动标识与获批时不同。
+- **结束许可**要求本批每个**仍被占用**节点的最新探活：在获批后采集、健康、启动标识与获批时不同；全部符合才一起释放。
+- **单节点完工**：同一张许可内节点恢复有先后，可凭申请号 + 批内节点逐个释放已恢复节点。该节点最新探活须符合原结单条件，否则许可状态不变。已释放节点立即重新参与多数票计算、可被新许可占用；其余节点继续由原许可占用。最后一个节点释放时整单自动结单。
 
 ## 快速开始（Docker Compose）
 
@@ -65,8 +66,9 @@ pytest tests/ -q
 | GET | `/liveness/{node}` | 单节点最新探活 |
 | POST | `/permits` | 申请许可（201 新批 / 200 幂等重发 / 409 拒绝） |
 | GET | `/permits?status=open\|finished` | 许可列表 |
-| GET | `/permits/{request_id}` | 单个许可 |
-| POST | `/permits/{request_id}/finish` | 结束许可（200 / 409 条件不满足） |
+| GET | `/permits/{request_id}` | 单个许可（含各节点释放状态） |
+| POST | `/permits/{request_id}/nodes/{node_id}/complete` | 单节点完工/释放（201 首次 / 200 幂等重发 / 409 条件不满足） |
+| POST | `/permits/{request_id}/finish` | 整单结束，仅检查仍占用节点（200 / 409 条件不满足） |
 
 ## 调用示例
 
@@ -140,16 +142,76 @@ curl -X POST http://localhost:8000/permits/req-001/finish
 可能原因：`no_liveness_report`、`not_sampled_after_approval`、`unhealthy`、`boot_id_unchanged`。
 许可结束后节点被释放，可被后续申请占用。
 
+### 5. 单节点完工（逐个释放，推荐演示脚本）
+
+一张许可批内节点恢复有先后。值班员可先释放已恢复的节点，继续安排后续维护：
+
+```bash
+# 申请两节点一批（n1 属 shard-a，n4 属 shard-b/c，各分片只扣一票仍过半）
+curl -X POST http://localhost:8000/permits \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"req-batch","nodes":["n1","n4"]}'
+
+# n1 重启完成并上报新探活（采样晚于获批、健康、boot_id 已变）后，单节点完工
+curl -X POST http://localhost:8000/permits/req-batch/nodes/n1/complete
+# 201 =>
+# {"request_id":"req-batch","node":"n1","released":true,
+#  "released_at":"...","idempotent_replay":false,"permit_finished":false,
+#  "permit":{"status":"open",...,"occupied_nodes":["n4"],
+#            "released_node_count":1}}
+```
+
+行为要点：
+
+- 条件不满足时返回 409，`reason` 与整单结束的逐节点原因相同
+  （`no_liveness_report` / `not_sampled_after_approval` / `unhealthy` /
+  `boot_id_unchanged`），**不写入释放记录，许可状态不变**。
+- 节点不在本许可名单内返回 404（`node_not_in_permit`）；许可不存在返回 404。
+- **重复办理已释放节点**返回 200 与**原释放时间**（`idempotent_replay=true`），
+  即使该节点已被新许可占用。
+- 已释放节点立即重新参与多数票计算，可被新申请占用；其余节点仍由原许可占用，
+  新申请触及它们仍会以 `occupied_nodes` 拒绝。
+- **最后一个仍占用节点释放时整单自动结单**（响应中 `permit_finished=true`）。
+- 原 `/finish` 接口只检查仍被本单占用的节点，全部符合才一起释放；
+  已单节点完工的节点保留各自的原释放时间。
+
+许可查询在原节点名单之外新增逐节点释放状态：
+
+```json
+{
+  "request_id": "req-batch",
+  "nodes": ["n1", "n4"],
+  "status": "open",
+  "node_releases": {
+    "n1": {"released": true,  "released_at": "2026-..."},
+    "n4": {"released": false, "released_at": null}
+  },
+  "occupied_nodes": ["n4"],
+  "released_node_count": 1
+}
+```
+
+一键演示（含"节点释放后再次获批"的完整调用，可直接对照期望状态码）：
+
+```bash
+./scripts/demo_node_release.sh            # 默认 http://localhost:8000
+./scripts/demo_node_release.sh http://host:port
+```
+
 ## 设计说明
 
 - **幂等**：`request_id` 是许可表主键。节点集合规范化（去重排序）后比较，
   同号同批重放直接返回原许可；同号不同批 409。被拒绝的申请不落库，整改后可用同号重试。
-- **并发**：所有写路径走单连接 + 可重入锁 + `BEGIN IMMEDIATE` 事务，
-  "检查多数票 → 写入许可"是原子的；并发申请串行判定，不会超批。
-- **持久化**：许可与全部探活报告存 SQLite（WAL 模式），最新探活按
-  `max(sampled_at)` 实时计算，服务重启后状态完整恢复。
-- **结束判定**：批准时快照各节点 `boot_id`；结束时要求最新报告
-  `sampled_at > approved_at` 且健康且 `boot_id` 不同。
+- **并发**：所有写路径（探活上报、发证、单节点完工、整单结束）走单连接 +
+  可重入锁 + `BEGIN IMMEDIATE` 事务，"检查多数票 → 写入许可/释放记录"是原子的，
+  并发请求按实际拿到写锁的顺序串行判定，不会超批、不会重复释放。
+- **持久化**：许可、节点释放记录与全部探活报告存 SQLite（WAL 模式），
+  最新探活按 `max(sampled_at)` 实时计算，服务重启后状态完整恢复、可续办。
+- **结束判定**：批准时快照各节点 `boot_id`；单节点完工与整单结束共用同一判定
+  ——最新报告 `sampled_at > approved_at` 且健康且 `boot_id` 不同。
+- **节点释放**：新增 `node_releases` 表（`permit_request_id, node_id` 联合主键）。
+  新申请判定占用时只统计各 open 许可的**未释放**节点；已释放节点重新计票。
+  升级前已存在的未结许可在该表无记录，自动视为尚未释放任何节点，无需手工迁移。
 
 ## 已知限制 / 未完成项
 

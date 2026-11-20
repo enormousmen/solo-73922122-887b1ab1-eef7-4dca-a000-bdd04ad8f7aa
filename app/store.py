@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS permits (
     finished_at TEXT,
     boot_ids_at_approval TEXT NOT NULL    -- JSON 对象 node -> boot_id
 );
+
+-- 单节点完工记录：一个许可的每个节点至多释放一次。
+-- 升级前已存在的未结许可在此表无记录，视为尚未释放任何节点。
+CREATE TABLE IF NOT EXISTS node_releases (
+    permit_request_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    released_at TEXT NOT NULL,
+    PRIMARY KEY (permit_request_id, node_id),
+    FOREIGN KEY (permit_request_id) REFERENCES permits(request_id)
+);
 """
 
 # 每个节点取采样时间最新的一份；采样时间并列时取后写入的一条。
@@ -112,8 +122,16 @@ class Store:
 
     # ---- 许可 ----
 
-    @staticmethod
-    def _row_to_permit(row: sqlite3.Row) -> PermitRecord:
+    def _releases_for(self, request_id: str) -> dict:
+        """读取某许可的节点释放记录 {node: datetime}，按节点名排序。"""
+        rows = self._conn.execute(
+            "SELECT node_id, released_at FROM node_releases "
+            "WHERE permit_request_id = ? ORDER BY node_id",
+            (request_id,),
+        ).fetchall()
+        return {r["node_id"]: parse_iso(r["released_at"]) for r in rows}
+
+    def _row_to_permit(self, row: sqlite3.Row) -> PermitRecord:
         return PermitRecord(
             request_id=row["request_id"],
             nodes=tuple(json.loads(row["nodes"])),
@@ -121,6 +139,7 @@ class Store:
             approved_at=parse_iso(row["approved_at"]),
             finished_at=parse_iso(row["finished_at"]) if row["finished_at"] else None,
             boot_ids_at_approval=json.loads(row["boot_ids_at_approval"]),
+            released_nodes=self._releases_for(row["request_id"]),
         )
 
     def get_permit(self, request_id: str) -> PermitRecord | None:
@@ -169,3 +188,41 @@ class Store:
                 "WHERE request_id = ?",
                 (to_iso(finished_at), request_id),
             )
+
+    # ---- 单节点完工（节点释放） ----
+
+    def get_release(self, request_id: str, node_id: str):
+        """返回某节点在该许可下的释放时间；未释放返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT released_at FROM node_releases "
+                "WHERE permit_request_id = ? AND node_id = ?",
+                (request_id, node_id),
+            ).fetchone()
+        return parse_iso(row["released_at"]) if row else None
+
+    def insert_release(
+        self, request_id: str, node_id: str, released_at
+    ) -> None:
+        """写入单节点释放记录。调用方须在写事务内，并保证此前未释放过。"""
+        self._conn.execute(
+            "INSERT INTO node_releases (permit_request_id, node_id, released_at) "
+            "VALUES (?,?,?)",
+            (request_id, node_id, to_iso(released_at)),
+        )
+
+    def insert_releases_bulk(self, request_id: str, releases: dict) -> None:
+        """整批结单时一次性补齐各节点释放记录。调用方须在写事务内。
+
+        已存在的释放记录（此前单节点完工写入）保留原释放时间，不覆盖。
+        """
+        if not releases:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO node_releases "
+            "(permit_request_id, node_id, released_at) VALUES (?,?,?)",
+            [
+                (request_id, node_id, to_iso(at))
+                for node_id, at in sorted(releases.items())
+            ],
+        )
